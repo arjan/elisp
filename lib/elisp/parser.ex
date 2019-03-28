@@ -5,13 +5,33 @@ defmodule Elisp.Parser.Helper do
     p |> ascii_string([9, 10, 11, 12, 13, 32], min: 1)
   end
 
+  def eol(p \\ empty()) do
+    ascii_char(p, [?\n])
+  end
+
+  def comment(p \\ empty()) do
+    p
+    |> ascii_char([?;])
+    |> choice([
+      utf8_string([not: ?\n], min: 1) |> eol(),
+      utf8_string([], min: 1) |> eos(),
+      eos(),
+      eol()
+    ])
+  end
+
   def opt_ws(p \\ empty()) do
     p
-    # ignore all direct whitespace
-    |> optional(ignore(ws()))
-    # comment
-    |> optional(
-      ignore(ascii_char([?;]) |> utf8_string([], min: 1) |> choice([ascii_char([10]), eos()]))
+    # eat all whitespace and comments
+    |> ignore(
+      optional(
+        repeat(
+          choice([
+            ws(),
+            comment()
+          ])
+        )
+      )
     )
   end
 end
@@ -21,8 +41,14 @@ defmodule Elisp.Parser do
   import Elisp.Parser.Helper
 
   integer =
-    integer(min: 1)
-    |> unwrap_and_tag(:integer)
+    optional(ascii_char([?+, ?-]) |> unwrap_and_tag(:sign))
+    |> integer(min: 1)
+    |> tag(:integer)
+    |> map(:to_integer)
+
+  def to_integer({:integer, [r]}), do: r
+  def to_integer({:integer, [{:sign, ?-}, r]}), do: -r
+  def to_integer({:integer, [{:sign, ?+}, r]}), do: r
 
   identifier =
     ascii_char([?a..?z])
@@ -43,19 +69,41 @@ defmodule Elisp.Parser do
     |> tag(:string)
     |> map({__MODULE__, :to_binary, []})
 
+  dot =
+    ascii_char([?.])
+    |> map(:dot)
+
+  defp dot(_), do: :dot
+
   def to_binary({tag, s}), do: {tag, to_string(s)}
 
   list =
-    ignore(ascii_char([40]))
+    ignore(ascii_char([?(]))
     |> opt_ws()
     |> concat(parsec(:list_inner))
     |> opt_ws()
-    |> ignore(ascii_char([41]))
+    |> ignore(ascii_char([?)]))
     |> tag(:list)
+
+  vector =
+    ignore(ascii_char([?[]))
+    |> opt_ws()
+    |> concat(parsec(:list_inner))
+    |> opt_ws()
+    |> ignore(ascii_char([?]]))
+    |> tag(:vector)
+
+  item_types = [identifier, integer, string, dot, list, vector]
+  item = choice(item_types)
+
+  quoted =
+    ignore(ascii_char([?']))
+    |> choice(item_types)
+    |> unwrap_and_tag(:quoted)
 
   defcombinatorp(
     :item,
-    choice([identifier, integer, string, list])
+    choice([quoted, item])
   )
 
   defcombinatorp(
@@ -63,10 +111,9 @@ defmodule Elisp.Parser do
     optional(parsec(:item))
     |> optional(
       repeat(
-        concat(
-          ignore(ws()),
-          parsec(:item)
-        )
+        ignore(ws())
+        |> opt_ws()
+        |> parsec(:item)
       )
     )
   )
@@ -79,8 +126,10 @@ defmodule Elisp.Parser do
       {:ok, result, "", _, _, _} ->
         {:ok, result}
 
-      {:ok, _result, _, _, _, _} ->
-        {:error, "Garbage at end of input"}
+      {:ok, _result, rest, _, _, _} = r ->
+        IO.inspect(r, label: "r")
+
+        {:error, "Parse error near: #{rest}"}
 
       e ->
         {:error, :parse_error, e}
